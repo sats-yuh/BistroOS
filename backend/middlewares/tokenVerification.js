@@ -1,31 +1,65 @@
-const createHttpError = require("http-errors");
-const jwt = require("jsonwebtoken");
-const config = require("../config/config");
-const User = require("../models/userModel");
+import jwt from "jsonwebtoken";
+import { ApiError } from "../utils/ApiError.js";
+import { UserModel } from "../models/userModel.js";
 
-const isVerifiedUser = async (req, res, next) => {
+export const verifyJWT = async (req, res, next) => {
   try {
-    const { accessToken } = req.cookies;
+    // Try to get token from Authorization header first, then from cookie
+    const token =
+      req.header("Authorization")?.replace("Bearer ", "") ||
+      req.cookies?.accessToken;
 
-    if (!accessToken) {
-      const error = createHttpError(401, "Please provide token!");
-      return next(error);
+    if (!token) {
+      throw new ApiError(401, "Unauthorized request. Please provide token!");
     }
 
-    const decodeToken = jwt.verify(accessToken, config.accessTokenSecret);
+    // Verify token
+    const decodedToken = jwt.verify(token, process.env.ACCESS_TOKEN_SECRET);
 
-    const user = await User.findById(decodeToken._id);
+    // Find user
+    const user = await UserModel.findById(decodedToken?._id).select(
+      "-password -refreshToken"
+    );
+
     if (!user) {
-      const error = createHttpError(401, "User not exist!");
-      return next(error);
+      throw new ApiError(401, "User does not exist!");
     }
 
+    // Check if user is enabled
+    if (user.status !== "enabled") {
+      throw new ApiError(
+        403,
+        "Account is disabled. Please contact administrator."
+      );
+    }
+
+    // Attach user to request object
     req.user = user;
     next();
   } catch (error) {
-    const err = createHttpError(401, "Invalid Token!");
-    next(err);
+    console.error("Auth middleware error:", error.message);
+
+    if (error.name === "JsonWebTokenError") {
+      return next(new ApiError(401, "Invalid token!"));
+    }
+    if (error.name === "TokenExpiredError") {
+      return next(new ApiError(401, "Token expired!"));
+    }
+    next(new ApiError(401, error.message || "Authentication failed"));
   }
 };
 
-module.exports = { isVerifiedUser };
+// Optional: Role-based middleware
+export const authorizeRoles = (...roles) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      throw new ApiError(401, "Unauthorized request");
+    }
+
+    if (!roles.includes(req.user.role)) {
+      throw new ApiError(403, "Access denied. Insufficient permissions.");
+    }
+
+    next();
+  };
+};

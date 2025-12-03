@@ -4,6 +4,7 @@ import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { UserModel } from "../models/userModel.js";
 import mongoose from "mongoose";
+
 const userRoles = () => ["admin", "cashier", "kitchenStaff"];
 const userStatus = () => ["enabled", "disabled"];
 
@@ -120,13 +121,170 @@ const userSignup = async (req, res, next) => {
   }
 };
 
+// LOGIN CONTROLLER
+const userLogin = async (req, res, next) => {
+  try {
+    const { email, password } = req.body;
+
+    // Validate required fields
+    if (!email || !password) {
+      throw new ApiError(400, "Email and password are required");
+    }
+
+    // Find user by email
+    const user = await UserModel.findOne({ email: email.toLowerCase() });
+
+    // Check if user exists
+    if (!user) {
+      throw new ApiError(404, "User not found with this email");
+    }
+
+    // Check if user account is enabled
+    if (user.status !== "enabled") {
+      throw new ApiError(
+        403,
+        "Account is disabled. Please contact administrator"
+      );
+    }
+
+    // Verify password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+
+    if (!isPasswordValid) {
+      throw new ApiError(401, "Invalid email or password");
+    }
+
+    // Generate tokens
+    const { accessToken, refreshToken } = await generateRefreshAndAccessToken(
+      user._id
+    );
+
+    // Get user data without sensitive information
+    const loggedInUser = await UserModel.findById(user._id).select(
+      "-password -refreshToken -__v"
+    );
+
+    // Set both access token and refresh token in HTTP-only cookies
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+    };
+
+    // Set access token cookie (short-lived)
+    res.cookie("accessToken", accessToken, {
+      ...cookieOptions,
+      maxAge: 15 * 60 * 1000, // 15 minutes
+    });
+
+    // Set refresh token cookie (long-lived)
+    res.cookie("refreshToken", refreshToken, {
+      ...cookieOptions,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    });
+
+    // Return response with access token (for mobile/API clients) and user data
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          user: loggedInUser,
+          accessToken, // Also return in response for clients that don't use cookies
+          refreshToken, // Optional: return for mobile apps
+        },
+        "Login successful"
+      )
+    );
+  } catch (error) {
+    if (!error.message) {
+      error.message = "Something went wrong during login";
+    }
+    next(error);
+  }
+};
+
+// LOGOUT CONTROLLER
+const userLogout = async (req, res, next) => {
+  try {
+    const userId = req.user?._id;
+
+    if (!userId) {
+      throw new ApiError(401, "Unauthorized request");
+    }
+
+    // Clear refresh token from database
+    await UserModel.findByIdAndUpdate(
+      userId,
+      {
+        $unset: { refreshToken: 1 },
+      },
+      { new: true }
+    );
+
+    // Clear cookies
+    const cookieOptions = {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+    };
+
+    res.clearCookie("accessToken", cookieOptions);
+    res.clearCookie("refreshToken", cookieOptions);
+
+    return res
+      .status(200)
+      .json(new ApiResponse(200, {}, "Logged out successfully"));
+  } catch (error) {
+    if (!error.message) {
+      error.message = "Something went wrong during logout";
+    }
+    next(error);
+  }
+};
+
+// GET CURRENT USER PROFILE
+const getCurrentUser = async (req, res, next) => {
+  try {
+    const user = req.user; // Assuming auth middleware sets req.user
+
+    if (!user) {
+      throw new ApiError(401, "Unauthorized request");
+    }
+
+    const currentUser = await UserModel.findById(user._id).select(
+      "-password -refreshToken -__v"
+    );
+
+    if (!currentUser) {
+      throw new ApiError(404, "User not found");
+    }
+
+    return res
+      .status(200)
+      .json(
+        new ApiResponse(200, currentUser, "User profile retrieved successfully")
+      );
+  } catch (error) {
+    if (!error.message) {
+      error.message = "Something went wrong while fetching user profile";
+    }
+    next(error);
+  }
+};
+
 const refreshAccessToken = async (req, res, next) => {
   try {
-    // Get refresh token from HTTP-only cookie instead of request body
-    const incomingRefreshToken = req.cookies.refreshToken;
+    // Get refresh token from HTTP-only cookie or request body
+    const incomingRefreshToken =
+      req.cookies.refreshToken || req.body.refreshToken;
+
     if (!incomingRefreshToken) {
-      throw new ApiError(401, "unauthorized request");
+      throw new ApiError(
+        401,
+        "Unauthorized request. No refresh token provided."
+      );
     }
+
     let decodedRefreshToken;
     try {
       decodedRefreshToken = jwt.verify(
@@ -134,41 +292,62 @@ const refreshAccessToken = async (req, res, next) => {
         process.env.REFRESH_TOKEN_SECRET
       );
     } catch (error) {
-      error.statusCode = 401;
-      error.data = null;
-      error.success = false;
-      error.name = "jwt error";
-      next(error);
+      throw new ApiError(401, "Invalid or expired refresh token");
     }
+
     const user = await UserModel.findOne({ _id: decodedRefreshToken?._id });
+
     if (!user) {
-      throw new ApiError(404, "unknown user");
+      throw new ApiError(404, "User not found");
     }
+
     if (incomingRefreshToken !== user?.refreshToken) {
-      throw new ApiError(401, "unauthorized request");
+      throw new ApiError(401, "Refresh token is invalid or expired");
     }
+
     const { refreshToken: newRefreshToken, accessToken } =
       await generateRefreshAndAccessToken(user?._id);
 
-    // Set new refresh token in HTTP-only cookie
-    res.cookie("refreshToken", newRefreshToken, {
+    // Set new tokens in HTTP-only cookies
+    const cookieOptions = {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "strict",
+    };
+
+    res.cookie("accessToken", accessToken, {
+      ...cookieOptions,
+      maxAge: 15 * 60 * 1000, // 15 minutes
+    });
+
+    res.cookie("refreshToken", newRefreshToken, {
+      ...cookieOptions,
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     });
 
-    return res
-      .status(200)
-      .json(
-        new ApiResponse(200, { accessToken }, "token refreshed successfully")
-      );
+    return res.status(200).json(
+      new ApiResponse(
+        200,
+        {
+          accessToken,
+          refreshToken: newRefreshToken, // Optional: return for mobile apps
+        },
+        "Access token refreshed successfully"
+      )
+    );
   } catch (error) {
     if (!error.message) {
-      error.message = "something went wrong while generating access token";
+      error.message = "Something went wrong while refreshing access token";
     }
     next(error);
   }
 };
 
-export { userSignup, refreshAccessToken };
+// Export all controllers
+export {
+  userSignup,
+  userLogin,
+  userLogout,
+  getCurrentUser,
+  refreshAccessToken,
+};
